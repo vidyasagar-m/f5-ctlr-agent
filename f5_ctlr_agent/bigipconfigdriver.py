@@ -31,7 +31,12 @@ import time
 import traceback
 import copy
 import tempfile
-import pyinotify
+try:
+    import pyinotify
+    _ProcessEvent = pyinotify.ProcessEvent
+except ImportError:
+    pyinotify = None
+    _ProcessEvent = object
 
 from urllib.parse import urlparse
 from f5_cccl.api import F5CloudServiceManager
@@ -49,6 +54,7 @@ from f5_ctlr_agent.gtm.wideip import GTMWideIP
 from f5_ctlr_agent.gtm.pool import GTMPool
 from f5_ctlr_agent.gtm.monitor import GTMMonitor
 from f5_ctlr_agent.gtm.cleanup import GTMCleanup
+from f5_ctlr_agent.gtm.legacy import LegacyGTMManager
 
 log = logging.getLogger(__name__)
 console = logging.StreamHandler()
@@ -78,9 +84,59 @@ class KeyFilter(logging.Filter):
         return "PRIVATE KEY" not in record.getMessage()
 
 
+class SensitiveResponseFilter(logging.Filter):
+    """Filter to redact sensitive API response bodies from iControl REST logs.
+
+    Prevents disclosure of:
+    - Network topology (ARP entries, VXLAN tunnels, pod IPs, MAC addresses)
+    - Authentication data (partitions, tokens, credentials)
+    - TLS/SSL configuration (certificates, keys, cipher suites)
+    - Application configuration details (pool members, virtual servers)
+    """
+
+    # API namespaces that contain sensitive infrastructure data
+    SENSITIVE_API_PATTERNS = [
+        'tm:auth:',           # Authentication/authorization objects
+        'tm:net:arp:',        # ARP tables with pod IPs and MAC addresses
+        'tm:net:tunnel:',     # VXLAN/tunnel configs with management IPs
+        'tm:net:fdb:',        # Forwarding database entries
+        'tm:sys:crypto:',     # Cryptographic objects and keys
+        'tm:ltm:profile:client-ssl:',  # SSL profile configs
+        'tm:ltm:profile:server-ssl:',  # SSL profile configs
+        'tm:sys:application:service:',  # Application service configs
+        'tm:ltm:pool:',       # Pool member configurations
+    ]
+
+    def filter(self, record):
+        """Redact response bodies containing sensitive API data."""
+        msg = record.getMessage()
+
+        # Check if this is a debug response log from icontrol.session
+        if 'RESPONSE::' in msg or 'DEBUG RESPONSE::STATUS:' in msg:
+            # Check if response contains sensitive API namespace data
+            for pattern in self.SENSITIVE_API_PATTERNS:
+                if pattern in msg:
+                    # Redact the entire message and replace with security notice
+                    record.msg = "[REDACTED - Response contains sensitive %s data. Enable DEBUG logging only in secure development environments.]" % pattern
+                    record.args = ()
+                    return True
+
+        return True
+
+
 root_logger.addFilter(ResponseStatusFilter())
 root_logger.addFilter(CertFilter())
 root_logger.addFilter(KeyFilter())
+root_logger.addFilter(SensitiveResponseFilter())
+
+# Ensure filters apply to library loggers from CCCL and f5-sdk
+# even if they configure their own handlers
+for logger_name in ['icontrol.session', 'icontrol', 'f5.bigip', 'f5_cccl']:
+    lib_logger = logging.getLogger(logger_name)
+    lib_logger.handlers = []         # Remove any SDK-attached handlers
+    lib_logger.propagate = True      # Ensure propagation to root logger
+    lib_logger.setLevel(logging.WARNING)  # Suppress at source
+
 
 
 # E7: Module-level tracking for temporary certificate files
@@ -471,7 +527,9 @@ def create_network_config(config):
             and config['vxlan-arp']['arps'] is not None):
         net['arps'] = config['vxlan-arp']['arps']
     else:
-        log.debug("NET Config: %s", json.dumps(net))
+        log.debug("NET Config: routes=%d tunnels=%d",
+                  len(net.get('routes', [])),
+                  len(net.get('userFdbTunnels', [])))
     return net
 
 
@@ -643,9 +701,39 @@ class ConfigHandler():
         gtmIncomplete = 0
         for mgr in self._managers:
             if mgr.is_gtm():
-                oldGtmConfig = mgr._gtm.get_gtm_config()
                 partition = "Common"
                 try:
+                    allConfig = get_gtm_config(config)
+                    if not allConfig:
+                        continue
+
+                    # Go encodes an empty, uninitialized pools slice as null.
+                    for part_config in allConfig["config"].values():
+                        for wideip in part_config.get("wideIPs") or []:
+                            if wideip.get("pools") is None:
+                                wideip["pools"] = []
+
+                    mode = "bnk" if any(
+                        key in allConfig for key in
+                        ("clusterIdentifier", "digitalAssetID",
+                         "enableDataServerMonitor")
+                    ) else "standalone"
+                    current_mode = getattr(mgr, "_gtm_mode", None)
+                    if current_mode is None:
+                        if mode == "standalone":
+                            mgr._gtm = LegacyGTMManager(
+                                mgr._gtm.mgmt_root(), partition)
+                        mgr._gtm_mode = mode
+                    elif current_mode != mode:
+                        raise F5CcclError(
+                            msg="GTM configuration contract changed from {} to {}"
+                            .format(current_mode, mode))
+
+                    if mode == "standalone":
+                        self._update_legacy_gtm(mgr._gtm, allConfig, partition)
+                        continue
+
+                    oldGtmConfig = mgr._gtm.get_gtm_config()
                     # RETRY FIX: Check for pending cleanup BEFORE isConfigSame check
                     # This allows cleanup retry even when config hasn't changed
                     if mgr._gtm._pending_cleanup is not None:
@@ -655,7 +743,6 @@ class ConfigHandler():
                         # If retry succeeded, pending_cleanup is cleared in retry method
                         # If retry failed, it will raise F5CcclError again
                     
-                    allConfig = get_gtm_config(config)
                     if bool(allConfig):
                         newGtmConfig = allConfig["config"]
                         self._deleted_tenants = allConfig["deletedTenants"]
@@ -755,11 +842,26 @@ class ConfigHandler():
                                 _wip_count, _bip))
 
                 except F5CcclError as e:
-                    _bip = mgr._gtm._bigip_host if hasattr(mgr, '_gtm') and mgr._gtm else 'unknown'
+                    _bip = getattr(mgr._gtm, '_bigip_host', 'unknown')
                     _code = _extract_http_code(str(e))
                     log.error("GTM Error.....:%s, bigip: %s, error_code: %s", e.msg, _bip, _code)
                     gtmIncomplete += 1
         return gtmIncomplete
+
+    def _update_legacy_gtm(self, manager, config, partition):
+        old_config = manager.get_gtm_config()
+        new_config = config["config"]
+        self._deleted_tenants = config["deletedTenants"]
+        manager.pre_process_gtm(new_config)
+        if old_config == new_config:
+            return
+        if partition in new_config:
+            if not old_config:
+                manager.remove_unused_poolmembers(partition, new_config[partition])
+                manager.create_gtm(partition, new_config)
+            else:
+                manager.delete_update_gtm(partition, new_config)
+        manager.replace_gtm_config(config)
 
     def _update_cccl(self, config):
         _handle_vxlan_config(config)
@@ -827,7 +929,7 @@ class ConfigHandler():
             self._backoff_time *= 2
 
 
-class ConfigWatcher(pyinotify.ProcessEvent):
+class ConfigWatcher(_ProcessEvent):
     def __init__(self, config_file, on_change):
         basename = os.path.basename(config_file)
         if not basename or 0 == len(basename):
@@ -863,6 +965,8 @@ class ConfigWatcher(pyinotify.ProcessEvent):
             return False
 
     def loop(self):
+        if pyinotify is None:
+            raise ConfigError("pyinotify is required to watch the configuration file")
         self._running = True
         if not os.path.exists(self._config_dir):
             log.info(
@@ -1997,12 +2101,20 @@ def _handle_global_config(config):
 
     try:
         root_logger.setLevel(level)
+        # Suppress iControl REST session logging at source —
+        # response bodies contain sensitive BIG-IP configuration data
+        # (ARP tables, VXLAN tunnels, pool members, credentials).
+        # This applies unconditionally, even in DEBUG mode.
+        logging.getLogger('icontrol.session').setLevel(logging.WARNING)
+        logging.getLogger('icontrol').setLevel(logging.WARNING)
         if level > logging.DEBUG:
             logging.getLogger('requests.packages.urllib3.'
                               'connectionpool').setLevel(logging.WARNING)
     except:
         level = DEFAULT_LOG_LEVEL
         root_logger.setLevel(level)
+        logging.getLogger('icontrol.session').setLevel(logging.WARNING)
+        logging.getLogger('icontrol').setLevel(logging.WARNING)
         if level > logging.DEBUG:
             logging.getLogger('requests.packages.urllib3.'
                               'connectionpool').setLevel(logging.WARNING)
@@ -2404,6 +2516,11 @@ def main():
                 bigip_trusted_certs, 'bigip', worker_id) if bigip_trusted_certs else None
             gtm_ca_certs_path = _create_temp_cert_file(
                 gtm_trusted_certs, 'gtmbigip', worker_id) if gtm_trusted_certs else None
+
+        if bigip_trusted_certs and not bigip_ca_certs_path:
+            raise ConfigError("Could not prepare BIG-IP trusted certificates")
+        if gtm_trusted_certs and not gtm_ca_certs_path:
+            raise ConfigError("Could not prepare GTM BIG-IP trusted certificates")
 
         # BIG-IP to manage
         def _bigip_connect_cb(log_success):

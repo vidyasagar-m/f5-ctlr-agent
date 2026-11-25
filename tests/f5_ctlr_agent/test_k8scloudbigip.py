@@ -26,7 +26,7 @@ from f5_cccl.utils.mgmt import ManagementRoot
 from f5_cccl.bigip import BigIPProxy
 from f5_cccl.utils.mgmt import mgmt_root
 from f5_cccl.exceptions import F5CcclValidationError
-from .. import bigipconfigdriver as ctlr
+from f5_ctlr_agent import bigipconfigdriver as ctlr
 
 
 # Cloud app data

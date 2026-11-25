@@ -29,7 +29,7 @@ from f5_cccl.exceptions import F5CcclValidationError
 
 import pytest
 
-from .. import bigipconfigdriver
+from f5_ctlr_agent import bigipconfigdriver
 
 _args_app_name = ['bigipconfigdriver.py']
 

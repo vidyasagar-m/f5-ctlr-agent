@@ -23,12 +23,12 @@ def parse_requirements(filename):
     """Parse requirements from a file."""
     with open(filename, 'r') as f:
         return [
-            line.strip() for line in f
+            line.split('@', 1)[0].strip() if 'git+' in line else line.strip()
+            for line in f
             if line.strip()
             and not line.startswith('#')
             and not line.startswith('-e')
             and not line.startswith('-')
-            and not 'git+' in line
         ]
 
 
